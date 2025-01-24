@@ -20,7 +20,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [
             InlineKeyboardButton("📥 Загрузить товары", callback_data='upload_products'),
-            InlineKeyboardButton("📤 Выгрузить товары", callback_data='export_products')
+            InlineKeyboardButton("📄 Скачать шаблон", callback_data='download_template')
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -43,12 +43,14 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  "D: ID категории\n"
                  "E: ID подкатегории\n"
                  "F: ID бренда\n"
-                 "G: Спецификации (краткие)\n"
-                 "H: Спецификации (подробные)\n"
-                 "I: Ссылка где купить"
+                 "G: ID модели\n"
+                 "H: ID модификации\n"
+                 "I: Спецификации (краткие)\n"
+                 "J: Спецификации (подробные)\n"
+                 "K: Ссылка где купить"
         )
-    elif query.data == 'export_products':
-        await export_products(update, context)
+    elif query.data == 'download_template':
+        await create_and_send_template(update.callback_query.message)
 
 async def process_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -137,13 +139,17 @@ async def create_product_in_strapi(session, product_data, image_id):
             }
         }
 
-        # Add relations
+        # Add relations with proper format for Strapi v4 manyToOne relations
         if product_data.get('category'):
-            data["data"]["category"] = product_data['category']
+            data["data"]["category"] = {"id": product_data['category']}
         if product_data.get('subcategory'):
-            data["data"]["subcategory"] = product_data['subcategory']
+            data["data"]["subcategory"] = {"id": product_data['subcategory']}
         if product_data.get('brand'):
-            data["data"]["brand"] = product_data['brand']
+            data["data"]["brand"] = {"id": product_data['brand']}
+        if product_data.get('model'):
+            data["data"]["model"] = {"id": product_data['model']}
+        if product_data.get('modification'):
+            data["data"]["modification"] = {"id": product_data['modification']}
 
         # Add image if provided and not None
         if image_id:
@@ -179,8 +185,8 @@ def extract_data_from_excel(excel_bytes):
             if not sheet.cell(row=row_idx, column=1).value:
                 continue
 
-            # Process specifications (column G)
-            spec_value = str(sheet.cell(row=row_idx, column=7).value or '')
+            # Process specifications (column I)
+            spec_value = str(sheet.cell(row=row_idx, column=9).value or '')
             specs = []
             if spec_value:
                 spec_parts = spec_value.split(',')
@@ -197,8 +203,8 @@ def extract_data_from_excel(excel_bytes):
                             "value": part.strip()
                         })
 
-            # Process detailed specifications (column H)
-            detailed_spec_value = str(sheet.cell(row=row_idx, column=8).value or '')
+            # Process detailed specifications (column J)
+            detailed_spec_value = str(sheet.cell(row=row_idx, column=10).value or '')
             detailed_specs = []
             if detailed_spec_value:
                 detailed_spec_parts = detailed_spec_value.split(',')
@@ -234,14 +240,19 @@ def extract_data_from_excel(excel_bytes):
                 'category': int(sheet.cell(row=row_idx, column=4).value or 0),
                 'subcategory': int(sheet.cell(row=row_idx, column=5).value or 0),
                 'brand': int(sheet.cell(row=row_idx, column=6).value or 0),
+                'model': int(sheet.cell(row=row_idx, column=7).value or 0),
+                'modification': int(sheet.cell(row=row_idx, column=8).value or 0),
                 'specifications': specs,
                 'detailedSpecifications': detailed_specs,
-                'whereToBuyLink': str(sheet.cell(row=row_idx, column=9).value or '').strip()
+                'whereToBuyLink': str(sheet.cell(row=row_idx, column=11).value or '').strip()
             }
             
             if product['name'] and product['article'] and product['category'] and product['whereToBuyLink']:
                 products_data.append(product)
+            else:
+                print(f"Skipping row {row_idx} due to missing required fields")
 
+        print(f"Successfully processed {len(products_data)} products from Excel")
         return products_data
 
     except Exception as e:
@@ -251,78 +262,63 @@ def extract_data_from_excel(excel_bytes):
         if os.path.exists(temp_file):
             os.remove(temp_file)
 
-async def export_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def create_and_send_template(message):
     try:
-        await update.callback_query.edit_message_text("⏳ Загружаю данные из Strapi...")
-        
         workbook = openpyxl.Workbook()
         sheet = workbook.active
         
         headers = ["Название", "Артикул", "Описание", "ID категории", "ID подкатегории", 
-                  "ID бренда", "Спецификации (краткие)", "Спецификации (подробные)", "Ссылка где купить"]
+                  "ID бренда", "ID модели", "ID модификации", "Спецификации (краткие)", 
+                  "Спецификации (подробные)", "Ссылка где купить"]
+        
+        # Add headers
         for col, header in enumerate(headers, 1):
             sheet.cell(row=1, column=col, value=header)
         
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                'Authorization': f'Bearer {STRAPI_API_TOKEN}',
-                'Content-Type': 'application/json'
-            }
-            
-            async with session.get(
-                f'{STRAPI_API_URL}/api/catalog-products?populate=*',
-                headers=headers
-            ) as response:
-                if response.status != 200:
-                    await update.callback_query.edit_message_text("❌ Ошибка при получении данных из Strapi")
-                    return
-                
-                data = await response.json()
-                products = data.get('data', [])
-                
-                for row, product in enumerate(products, 2):
-                    attrs = product.get('attributes', {})
-                    
-                    # Format specifications
-                    specs = attrs.get('specifications', [])
-                    specs_str = ', '.join([f"{spec.get('label', '')}:{spec.get('value', '')}" 
-                                         for spec in specs])
-                    
-                    # Format detailed specifications
-                    detailed_specs = attrs.get('detailedSpecifications', [])
-                    detailed_specs_str = ', '.join([f"{spec.get('label', '')}:{spec.get('value', '')}" 
-                                                  for spec in detailed_specs])
-
-                    sheet.cell(row=row, column=1, value=attrs.get('name', ''))
-                    sheet.cell(row=row, column=2, value=attrs.get('articleNumber', ''))
-                    sheet.cell(row=row, column=3, value=attrs.get('description', ''))
-                    sheet.cell(row=row, column=4, value=attrs.get('category', {}).get('data', {}).get('id', ''))
-                    sheet.cell(row=row, column=5, value=attrs.get('subcategory', {}).get('data', {}).get('id', ''))
-                    sheet.cell(row=row, column=6, value=attrs.get('brand', {}).get('data', {}).get('id', ''))
-                    sheet.cell(row=row, column=7, value=specs_str)
-                    sheet.cell(row=row, column=8, value=detailed_specs_str)
-                    sheet.cell(row=row, column=9, value=attrs.get('whereToBuyLink', ''))
+        # Add example row
+        example_data = [
+            "Тормозной диск передний",  # Название
+            "BD-12345",                 # Артикул
+            "Высококачественный тормозной диск для передней оси",  # Описание
+            "1",                        # ID категории
+            "2",                        # ID подкатегории
+            "3",                        # ID бренда
+            "4",                        # ID модели
+            "5",                        # ID модификации
+            "Диаметр:280мм, Толщина:22мм",  # Спецификации (краткие)
+            "Диаметр:280мм, Толщина:22мм, Тип:Вентилируемый, Покрытие:С покрытием",  # Спецификации (подробные)
+            "https://example.com/product"  # Ссылка где купить
+        ]
         
-        temp_file = 'products_export.xlsx'
+        for col, value in enumerate(example_data, 1):
+            sheet.cell(row=2, column=col, value=value)
+        
+        # Adjust column widths
+        for col in range(1, len(headers) + 1):
+            sheet.column_dimensions[openpyxl.utils.get_column_letter(col)].width = 20
+        
+        # Save template
+        temp_file = 'template.xlsx'
         workbook.save(temp_file)
         
-        await update.callback_query.message.reply_document(
+        # Send template
+        await message.reply_document(
             document=open(temp_file, 'rb'),
-            filename='products_export.xlsx',
-            caption=f"✅ Выгружено {len(products)} товаров"
+            filename='template.xlsx',
+            caption="✅ Шаблон для загрузки товаров"
         )
-
+        
         os.remove(temp_file)
         
-        await update.callback_query.edit_message_text(
-            "Экспорт завершен!\n\n"
-            "Для начала нового экспорта или загрузки используйте /start"
+        await message.reply_text(
+            "Используйте этот шаблон для подготовки данных.\n"
+            "После заполнения отправьте файл боту для загрузки товаров."
         )
         
     except Exception as e:
-        print(f"Error during export: {e}")
-        await update.callback_query.edit_message_text(
-            f"❌ Произошла ошибка при экспорте: {str(e)}\n\n"
+        print(f"Error creating template: {e}")
+        await message.reply_text(
+            "❌ Произошла ошибка при создании шаблона.\n"
             "Попробуйте еще раз используя /start"
         )
 
